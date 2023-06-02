@@ -25,7 +25,7 @@ def chat():
         message = data.get('message', '')  # Use empty string as default value if 'message' is not provided
 
         # load services.html from file
-        with open('static/services.html', 'r') as file:
+        with open('../davidlones.github.io/services.html', 'r') as file:
             services_html = file.read()
 
         # Call OpenAI API here with the message
