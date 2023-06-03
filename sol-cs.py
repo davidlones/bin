@@ -1,7 +1,9 @@
 from flask import Flask, request, jsonify, make_response
 import openai
 import os
+import subprocess
 from flask_cors import CORS
+from werkzeug.serving import run_simple
 
 # Set your OpenAI API key
 openai.api_key = os.getenv('OPENAI_API_KEY')
