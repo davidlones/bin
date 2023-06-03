@@ -48,4 +48,9 @@ def chat():
         return make_response(jsonify({'error': 'Invalid request'}), 415)
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8042)
+    # Generate a self-signed certificate if it doesn't exist
+    if not os.path.exists('cert.pem') or not os.path.exists('key.pem'):
+        subprocess.call(['openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-nodes', '-out', 'cert.pem', '-keyout', 'key.pem', '-days', '365', '-subj', '/CN=localhost'])
+
+    run_simple('0.0.0.0', 8042, app, ssl_context=('cert.pem', 'key.pem'))
+    
