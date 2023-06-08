@@ -9,11 +9,7 @@ from werkzeug.serving import run_simple
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
 app = Flask(__name__)
-#CORS(app, origins=["https://davidlones.github.io"])
-#list of domains
-allowed_domains = ["https://davidlones.github.io", "http://localhost:8042", "http://24.199.114.50:8042"]
-#add origins for a list of domains
-CORS(app, origins=allowed_domains)
+CORS(app, origins=["https://davidlones.github.io"])
 
 @app.route('/api', methods=['POST', 'OPTIONS'])
 def chat():
