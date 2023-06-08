@@ -4,6 +4,7 @@ import os
 import subprocess
 from flask_cors import CORS
 from werkzeug.serving import run_simple
+from OpenSSL import SSL
 
 # Set your OpenAI API key
 openai.api_key = os.getenv('OPENAI_API_KEY')
@@ -53,6 +54,12 @@ if __name__ == '__main__':
     # Generate a self-signed certificate if it doesn't exist
     if not os.path.exists('cert.pem') or not os.path.exists('key.pem'):
         subprocess.call(['openssl', 'req', '-x509', '-newkey', 'rsa:4096', '-nodes', '-out', 'cert.pem', '-keyout', 'key.pem', '-days', '365', '-subj', '/CN=localhost'])
+
+    context = SSL.Context(SSL.PROTOCOL_TLSv1_2)
+    context.use_privatekey_file('key.pem')
+    context.use_certificate_file('cert.pem')
+
+    run_simple('0.0.0.0', 8042, app, ssl_context=context)
 
     run_simple('0.0.0.0', 8042, app, ssl_context=('cert.pem', 'key.pem'))
     
