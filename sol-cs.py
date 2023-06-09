@@ -46,9 +46,9 @@ def chat():
         response = openai.ChatCompletion.create(
             model="gpt-3.5-turbo",
             messages=[
-                {"role": "system", "content": "You are Sol, a helpful assistant designed by David to help him help others. You take a customers description of their problem and respond with the body of an email detailing the issue and what services David can provide. You then take that e-mail and summarize it for the customer, only relaying the information that is relevant to them."},
+                {"role": "system", "content": "You are Sol, a helpful assistant designed by David to help him help others. We've just taken a customers description of their problem and written the body of an email detailing the issue and what services David can provide. You are to take that e-mail and summarize it for the customer, only relaying the information that is relevant to them, in a chat conversation."},
                 {"role": "assistant", "content": f"I am ready to review the email we wrote to David so I can summarize the email for the customer, only relaying the information that is relevant to them. For context, here's the content of our webpage ({services_html})."},
-                {"role": "user", "content": f"Here is the email we wrote to David: '{email_message}'. Please summarize this email for the customer, only relaying the information that is relevant to them. Emphasize in your message a general expected price and a basic overview of our services that match."},
+                {"role": "user", "content": f"Here is the email we wrote to David: '{email_message}'. Please summarize this email for the customer, only relaying the information that is relevant to them, and respond to them in the chat. Emphasize in your message the general expected price and a basic overview of our services that match. State that exact pricing may vary based on the customers specific needs and that we will provide a more accurate quote after we have a chance to review their issue in more detail. Provide my email address to the customer so they can contact me directly if they have any questions."},
             ]
         )
         assistant_message = response['choices'][0]['message']['content']
