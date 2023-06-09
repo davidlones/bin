@@ -36,10 +36,24 @@ def chat():
             messages=[
                 {"role": "system", "content": "You are Sol, a helpful assistant designed by David to help him help others. You take a customers description of their problem and respond with the body of an email detailing the issue and what services David can provide."},
                 {"role": "assistant", "content": f"I will take the customers description of their problem and respond with the well formated body of an email to send to David, detailing a description of the customers issue, a list of possible services we could provide based on their issues and the content our webpage ({services_html}), and the dollar amount we could charge the customer for our services, to be sent to David to review later today."},
-                {"role": "user", "content": f"A customer has written to us concerning the following: '{message}'. Write an email to David using the following email format: '\n\nHi David,\n\nI hope you are having a great day!\n\nI am writing to you today because I have a customer who is experiencing the following issue:\n\n<summerization of the customers description of their issue>\n\nI believe we could provide the following services to help them:\n\n<list of services the we offer that apply to the customers needs>\n\nI believe we could charge the customer the following amount for our services:\n\n<amount>\n\nPlease review this request and let me know what you think.\n\nBest,\n\nYour Helpful Assistant, Sol\n\n'"},
+                {"role": "user", "content": f"A customer has written to us the following: '{message}'. Write an email to David using the following email format: '\n\nHi David,\n\nI hope you are having a great day!\n\nI am writing to you today because I have a customer who is experiencing the following issue:\n\n<summerization of the customers description of their issue>\n\nI believe we could provide the following services to help them:\n\n<list of services the we offer that apply to the customers needs>\n\nI believe we could charge the customer the following amount for our services:\n\n<amount>\n\nPlease review this request and let me know what you think.\n\nBest,\n\nYour Helpful Assistant, Sol\n\n'"},
+            ]
+        )
+        email_message = response['choices'][0]['message']['content']
+        
+        # Call OpenAI API here with the message
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are Sol, a helpful assistant designed by David to help him help others. You take a customers description of their problem and respond with the body of an email detailing the issue and what services David can provide. You then take that e-mail and summarize it for the customer, only relaying the information that is relevant to them."},
+                {"role": "assistant", "content": f"I am ready to review the email we wrote to David so I can summarize the email for the customer, only relaying the information that is relevant to them. For context, here's the content of our webpage ({services_html})."},
+                {"role": "user", "content": f"Here is the email we wrote to David: '{email_message}'. Please summarize this email for the customer, only relaying the information that is relevant to them. Emphasize in your message a general expected price and a basic overview of our services that match."},
             ]
         )
         assistant_message = response['choices'][0]['message']['content']
+        
+        
+        
         print("User Message: ", message)
         print("API Response: ", assistant_message) # print API response to terminal
 
