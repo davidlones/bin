@@ -40,6 +40,7 @@ def chat():
             ]
         )
         email_message = response['choices'][0]['message']['content']
+        print(email_message)
         
         # Call OpenAI API here with the message
         response = openai.ChatCompletion.create(
