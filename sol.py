@@ -26,7 +26,7 @@ def call_openai_with_retry(messages):
     for i in range(retries):
         try:
             response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
+                model="gpt-3.5-turbo-16k-0613",
                 messages=messages,
                 max_tokens=50,
                 temperature=0.4,
