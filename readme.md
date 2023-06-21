@@ -76,11 +76,68 @@ python treecat.py /path/to/directory
 You can also specify the `--no-file-output` flag to only print the directory structure and not the contents of the files:
 
 ```bash
-python treecat.py /path/to/d
-
-irectory --no-file-output
+python treecat.py /path/to/directory --no-file-output
 ```
 
 This is useful if you want to get a quick overview of the directory structure that Sol is working with.
 
 Note: If an error occurs while generating a completion, it catches the exception and prints an error message. The Sol utility with TreeCat offers an easy way to search through text data and have a conversation with an AI assistant that is informed by that data, with the added advantage of visualizing the file structure and contents.
+
+If you run TreeCat on a directory using the command `python treecat.py project_directory`, the output could look something like this:
+
+```bash
+├── project_directory/
+│   ├── main.py
+│   │   # contents of main.py
+│   │   print("Hello, World!")
+│   │   
+│   ├── helper.py
+│   │   # contents of helper.py
+│   │   def add(a, b):
+│   │       return a + b
+│   │   
+│   ├── data/
+│   │   ├── data1.txt
+│   │   │   # contents of data1.txt
+│   │   │   Hello, this is some text data.
+│   │   │   
+│   │   ├── data2.csv
+│   │   │   # contents of data2.csv
+│   │   │   id,name,score
+│   │   │   1,Alice,85
+│   │   │   2,Bob,90
+│   │   │   
+│   ├── docs/
+│   │   ├── readme.md
+│   │   │   # contents of readme.md
+│   │   │   # Project Title
+│   │   │   
+│   │   ├── contributing.md
+│   │   │   # contents of contributing.md
+│   │   │   # How to Contribute
+│   │   │   
+```
+
+In the output, `├──` represents a file or a directory, `│   ` is used to represent the hierarchical level of a file or a directory, and `# contents of ...` denotes the contents of a file.
+
+Note: The actual contents of the files in the above output are just simple examples. Your actual files' contents could be much more complex and large.
+
+If you do not wish to see the file contents, you can use the `--no-file-output` option:
+
+```bash
+python treecat.py project_directory --no-file-output
+```
+
+This would output only the directory and file structure, excluding the contents:
+
+```bash
+├── project_directory/
+│   ├── main.py
+│   ├── helper.py
+│   ├── data/
+│   │   ├── data1.txt
+│   │   ├── data2.csv
+│   ├── docs/
+│   │   ├── readme.md
+│   │   ├── contributing.md
+```
