@@ -11,12 +11,12 @@ import pickle
 from dotenv import load_dotenv
 
 def save_conversation_history(messages):
-    with open('/home/user/conversation_history.pkl', 'wb') as f:
+    with open('~/conversation_history.pkl', 'wb') as f:
         pickle.dump(messages, f)
 
 def load_conversation_history():
     try:
-        with open('/home/user/conversation_history.pkl', 'rb') as f:
+        with open('~/conversation_history.pkl', 'rb') as f:
             return pickle.load(f)
     except FileNotFoundError:
         return []
@@ -89,7 +89,7 @@ def get_all_files(exclude_dirs, extensions, recursive, verbose=True):
 
 def load_or_generate_embeddings(all_files, verbose=True):
     try:
-        with open('/home/user/embeddings.pkl', 'rb') as f:
+        with open('~/embeddings.pkl', 'rb') as f:
             file_embeddings = pickle.load(f)
     except FileNotFoundError:
         file_embeddings = {}
@@ -115,7 +115,7 @@ def load_or_generate_embeddings(all_files, verbose=True):
             del file_embeddings[filepath]
 
     # Save embeddings to local database
-    with open('/home/user/embeddings.pkl', 'wb') as f:
+    with open('~/embeddings.pkl', 'wb') as f:
         pickle.dump(file_embeddings, f)
 
     return file_embeddings
@@ -218,7 +218,7 @@ def main():
 
     # If neither file nor string is provided, generate context from files in the directory tree
     else:
-        verbose = not os.path.exists('/home/user/embeddings.pkl')
+        verbose = not os.path.exists('~/embeddings.pkl')
 
         all_files = get_all_files(args.exclude, args.extensions, args.recursive, args.verbose)
         file_embeddings = load_or_generate_embeddings(all_files, args.verbose)
