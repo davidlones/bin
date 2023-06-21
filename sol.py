@@ -53,8 +53,8 @@ def generate_context(content, chunk_size, user_question):
     chunks = chunk_text(content, chunk_size)
     for chunk in chunks:
         messages.append({
-            "role": "assistant", 
-            "content": f"The user will ask: '{user_question}'. The answer might be in the following data that I must read and understand for later review: {chunk}"
+            "role": "system", 
+            "content": f"The user will ask: '{user_question}'. The answer might be in the following data: {chunk}"
         })
     return messages
 
@@ -154,7 +154,7 @@ def generate_context_from_files(file_embeddings, user_question):
             selected_chunk = chunks[chunk_index].strip()  # Remove leading and trailing whitespace, including new lines
             parts.append(selected_chunk)
     context = ', '.join(f'"{part}"' for part in parts)
-    messages.append({"role": "assistant", "content": f"The user will ask: '{user_question}'. The answer might be in the following data that I must read and understand for later review: {context}"})
+    messages.append({"role": "system", "content": f"The user will ask: '{user_question}'. The answer might be in the following data: {context}"})
     return messages
 
 def main():
@@ -167,6 +167,7 @@ def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Generate embeddings for files and find the most similar ones to a query.')
     parser.add_argument('question', help='The user question.')
+    parser.add_argument('--show-history', action='store_true', help='Show conversation history.')
     parser.add_argument('--no-context', action='store_true', help='Ask the question without any context.')
     parser.add_argument('--recursive', action='store_true', help='Enable recursive search. If not provided, the search will be limited to the current directory.')
     parser.add_argument('--extensions', nargs='*', default=[], help='A list of file extensions to include.')
@@ -181,6 +182,25 @@ def main():
 
     # Load conversation history
     messages = load_conversation_history()
+
+    # Show conversation history if --show-history flag is set
+    if args.show_history:
+        user_counter = 1
+        assistant_counter = 1
+        # Take the 10 most recent messages
+        recent_messages = messages[-10:]
+        for message in recent_messages:
+            role = message['role']
+            content = message['content']
+            if role == 'system':
+                continue
+            elif role == 'user':
+                print(f"User Message {user_counter}:")
+                user_counter += 1
+            elif role == 'assistant':
+                print(f"Assistant Message {assistant_counter}:")
+                assistant_counter += 1
+            print(f"  {content}\n")
 
     # If there's no conversation history, start a new conversation
     if len(messages) == 0:
@@ -214,6 +234,7 @@ def main():
 
         # Retrieve and print the assistant's reply
         assistant_reply = response.choices[0].message['content']
+        print()
         print(assistant_reply)
         
         # Save conversation history
