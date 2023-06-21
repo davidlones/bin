@@ -147,7 +147,7 @@ For this hypothetical example, let's assume that we're interested in finding inf
 To use Sol with this query, you would run it from the command line like this:
 
 ```bash
-python sol.py "What was the trend in our company's stock prices in Q2 2022?" --recursive --extensions .txt .csv .json
+python sol.py "What was the trend in our company's stock prices in Q2 2022?" --recursive --extensions .txt .csv .json -v
 ```
 
 The output would look something like this:
