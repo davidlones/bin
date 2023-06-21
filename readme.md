@@ -141,3 +141,27 @@ This would output only the directory and file structure, excluding the contents:
 │   │   ├── readme.md
 │   │   ├── contributing.md
 ```
+
+For this hypothetical example, let's assume that we're interested in finding information related to the company's stock price performance in Q2 2022. So, the question we want to ask Sol could be "What was the trend in our company's stock prices in Q2 2022?".
+
+To use Sol with this query, you would run it from the command line like this:
+
+```bash
+python sol.py "What was the trend in our company's stock prices in Q2 2022?" --recursive --extensions .txt .csv .json
+```
+
+The output would look something like this:
+
+```bash
+Scanning for file embeddings...
+Generating embeddings: 100%|███████████████████████| 4/4 [00:02<00:00,  2.50it/s]
+Starting conversation with OpenAI's GPT-3.5...
+
+The trend in the company's stock prices in Q2 2022 was generally positive, with a noticeable uptick in May and June. The stock price saw a significant increase, particularly in the latter half of Q2. Various factors contributed to this positive trend, including successful product launches, strong sales data, and positive market sentiment. 
+
+Please note that this is a summary based on available data and documents, and you should refer to the actual financial reports and data for more detailed information.
+```
+
+In this example, Sol.py would read through the text and CSV files, generate embeddings for each chunk of text, calculate the similarity of each embedding to the question, and then form a system message using the content from the most similar chunks. The question is then asked using these system messages as the initial conversation, and the assistant's reply is printed out.
+
+Please note that this is a hypothetical example. The actual response will depend on the contents of your documents and the specifics of your question.
