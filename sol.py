@@ -10,6 +10,8 @@ import concurrent.futures
 import pickle
 from dotenv import load_dotenv
 
+__version__ = '0.0.2'
+
 def save_conversation_history(messages):
     with open('~/conversation_history.pkl', 'wb') as f:
         pickle.dump(messages, f)
@@ -175,6 +177,7 @@ def main():
     parser.add_argument('--file', default=None, help='Path to a text file to use as context.')
     parser.add_argument('--string', default=None, help='A string to use as context.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output.')
+    parser.add_argument('--version', action='version', version=f'Sol v{__version__}')
     args = parser.parse_args()
 
     # Get the user's question from the command line arguments
