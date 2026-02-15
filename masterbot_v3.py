@@ -31,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextlib
-import fnmatch
 import hashlib
 import logging
 import math
@@ -147,22 +146,15 @@ class SolEngine:
 
     def _discover_files(self) -> List[Path]:
         knowledge = Path("./knowledge")
-        files: List[Path] = []
-        if knowledge.exists() and knowledge.is_dir():
-            for p in knowledge.rglob("*"):
-                if p.is_file() and p.suffix.lower() in {".txt", ".md", ".markdown"}:
-                    files.append(p)
-            return files
+        if not knowledge.exists() or not knowledge.is_dir():
+            logger.warning("SOL: ./knowledge directory not found. No indexing will occur.")
+            return []
 
-        includes = ["README.md", "*.md", "*.py"]
-        excludes = {".git", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", "logs"}
-        for p in Path(".").rglob("*"):
-            if not p.is_file():
-                continue
-            if any(part in excludes for part in p.parts):
-                continue
-            if any(fnmatch.fnmatch(p.name, pat) for pat in includes):
+        files: List[Path] = []
+        for p in knowledge.rglob("*"):
+            if p.is_file() and p.suffix.lower() in {".txt", ".md", ".markdown"}:
                 files.append(p)
+
         return files
 
     def _load_text_files(self) -> List[Tuple[str, float, str]]:
