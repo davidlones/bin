@@ -29,6 +29,8 @@ Notes:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextlib
 import fnmatch
 import hashlib
 import logging
@@ -41,6 +43,7 @@ import shelve
 import time
 from dataclasses import dataclass
 from pathlib import Path
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
@@ -112,10 +115,13 @@ class SolEngine:
     def __init__(self, client: OpenAI) -> None:
         self.client = client
         self.index_ready = False
+        self.is_building = False
+        self.build_progress = 0.0
         self.docs: List[Dict[str, Any]] = []
         self.embeddings: List[List[float]] = []
         self.model = "text-embedding-3-small"
         self.chunk_size = 900
+        self._state_lock = threading.Lock()
 
     @staticmethod
     def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
@@ -172,14 +178,48 @@ class SolEngine:
 
     def _embed_texts(self, texts: List[str]) -> List[List[float]]:
         vectors: List[List[float]] = []
-        for i in range(0, len(texts), 32):
-            batch = texts[i : i + 32]
+        total = len(texts)
+        if total == 0:
+            return vectors
+
+        batches = [(i, texts[i : i + 32]) for i in range(0, total, 32)]
+        max_workers = min(4, len(batches))
+
+        def embed_one(batch_item: Tuple[int, List[str]]) -> Tuple[int, List[List[float]]]:
+            i, batch = batch_item
+            logger.info(f"SOL:  Embedding batch {i//32 + 1} ({i+1}-{min(i+32, total)}/{total})")
             result = self.client.embeddings.create(model=self.model, input=batch)
-            vectors.extend([list(item.embedding) for item in result.data])
+            return i, [list(item.embedding) for item in result.data]
+
+        if max_workers <= 1:
+            for batch_item in batches:
+                _, chunk_vectors = embed_one(batch_item)
+                vectors.extend(chunk_vectors)
+            return vectors
+
+        ordered_results: Dict[int, List[List[float]]] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(embed_one, item) for item in batches]
+            for future in concurrent.futures.as_completed(futures):
+                i, chunk_vectors = future.result()
+                ordered_results[i] = chunk_vectors
+
+        for i, _ in batches:
+            vectors.extend(ordered_results.get(i, []))
+
         return vectors
 
     def _build_index_sync(self) -> None:
+        start_time = time.time()
+        logger.info("SOL: Starting index build...")
+
+        with self._state_lock:
+            self.is_building = True
+            self.build_progress = 0.0
+
         corpus = self._load_text_files()
+        logger.info(f"SOL: Discovered {len(corpus)} source files.")
+
         try:
             cache = pickle.loads(SOL_EMBED_CACHE_PATH.read_bytes()) if SOL_EMBED_CACHE_PATH.exists() else {}
         except Exception:
@@ -189,18 +229,36 @@ class SolEngine:
         new_docs: List[Dict[str, Any]] = []
         new_embeddings: List[List[float]] = []
 
-        for path, mtime, text in corpus:
+        total_chunks = 0
+        cache_hits = 0
+        cache_misses = 0
+
+        for idx_file, (path, mtime, text) in enumerate(corpus, start=1):
+            progress = (idx_file / max(1, len(corpus))) * 100
+            with self._state_lock:
+                self.build_progress = progress
+
+            logger.info(f"SOL: Processing file {idx_file}/{len(corpus)} → {path}")
+            logger.info(f"SOL:  Progress {progress:.1f}%")
+
             cache_entry = cache_docs.get(path)
             if cache_entry and float(cache_entry.get("mtime", 0.0)) == float(mtime):
+                cache_hits += 1
+                chunk_count = len(cache_entry.get("chunks", []))
+                total_chunks += chunk_count
+                logger.info(f"SOL:  Cache hit ({chunk_count} chunks)")
                 for item in cache_entry.get("chunks", []):
                     new_docs.append(item["doc"])
                     new_embeddings.append(item["embedding"])
                 continue
 
+            cache_misses += 1
             chunks = self._chunk_text(text, chunk_size=self.chunk_size)
+            logger.info(f"SOL:  Cache miss → {len(chunks)} new chunks")
             if not chunks:
                 continue
             chunk_embeddings = self._embed_texts(chunks)
+            total_chunks += len(chunks)
             packaged_chunks = []
             for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
                 doc = {
@@ -221,9 +279,26 @@ class SolEngine:
                 del cache_docs[stale]
 
         SOL_EMBED_CACHE_PATH.write_bytes(pickle.dumps({"docs": cache_docs}))
+
+        elapsed = round(time.time() - start_time, 2)
+
+        logger.info("SOL: Index build complete.")
+        logger.info(f"SOL:  Total chunks indexed: {len(new_docs)}")
+        logger.info(f"SOL:  Total chunks processed: {total_chunks}")
+        logger.info(f"SOL:  Cache hits: {cache_hits}")
+        logger.info(f"SOL:  Cache misses: {cache_misses}")
+        logger.info(f"SOL:  Elapsed time: {elapsed} seconds")
+
         self.docs = new_docs
         self.embeddings = new_embeddings
         self.index_ready = True
+        with self._state_lock:
+            self.is_building = False
+            self.build_progress = 100.0
+
+    def build_progress_percent(self) -> int:
+        with self._state_lock:
+            return max(0, min(100, int(round(self.build_progress))))
 
     async def build_index(self) -> None:
         await asyncio.to_thread(self._build_index_sync)
@@ -274,6 +349,20 @@ async def rotate_presence() -> None:
     activity = discord.Game(name=f"{game}{suffix}")
     await bot.change_presence(activity=activity)
     logger.info(f"Presence changed to: {game}{suffix}")
+
+
+async def _presence_during_index_build(build_task: "asyncio.Task[None]") -> None:
+    spinner = ["◐", "◓", "◑", "◒"]
+    idx = 0
+    while not build_task.done():
+        pct = sol_engine.build_progress_percent()
+        activity = discord.Game(name=f"SOL warming up {spinner[idx % len(spinner)]} ({pct}%)")
+        try:
+            await bot.change_presence(status=discord.Status.idle, activity=activity)
+        except Exception:
+            logger.debug("SOL presence update skipped", exc_info=True)
+        idx += 1
+        await asyncio.sleep(2)
 
 # ----------------------------
 # Helpers
@@ -1139,14 +1228,16 @@ async def sol_cmd(ctx: commands.Context, *, question: str) -> None:
         return
 
     if not sol_engine.index_ready:
+        progress = sol_engine.build_progress_percent()
         logger.info(
-            "SOL requested before index ready: user_id=%s guild_id=%s channel_id=%s question=%r",
+            "SOL requested before index ready: user_id=%s guild_id=%s channel_id=%s progress=%s question=%r",
             ctx.author.id,
             ctx.guild.id if ctx.guild else None,
             ctx.channel.id,
+            progress,
             question[:120],
         )
-        await ctx.send("SOL index is warming up. Try again in a moment.")
+        await ctx.send(f"SOL warming up ({progress}%). Try again in a moment.")
         return
 
     try:
@@ -1243,10 +1334,16 @@ async def on_ready() -> None:
     if not rotate_presence.is_running():
         rotate_presence.start()
 
+    build_task = asyncio.create_task(sol_engine.build_index())
+    monitor_task = asyncio.create_task(_presence_during_index_build(build_task))
     try:
-        await sol_engine.build_index()
+        await build_task
     except Exception:
         logger.exception("SOL index build failed")
+    finally:
+        monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await monitor_task
 
 
 @bot.event
