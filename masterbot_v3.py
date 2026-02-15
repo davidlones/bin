@@ -202,6 +202,64 @@ async def resolve_post_channel(
     return ctx_channel
 
 
+def dm_screenplay_log(message: discord.Message) -> str:
+    now = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    author = f"{message.author} ({message.author.id})"
+    content_len = len(message.content)
+    word_count = len(message.content.split())
+
+    uptime = int(time.time() - bot.launch_time) if hasattr(bot, "launch_time") else "unknown"
+    latency_ms = round(bot.latency * 1000)
+
+    # lightweight read-only stats
+    try:
+        with _open_db() as db:
+            servers = db.get("servers", {})
+            server_count = len(servers)
+            user_count = sum(len(s.get("users", {})) for s in servers.values())
+    except Exception:
+        server_count = "?"
+        user_count = "?"
+
+    return (
+        "```\n"
+        "SCREENPLAY LOG — PRIVATE CHANNEL\n"
+        "--------------------------------\n"
+        f"TIMESTAMP      : {now}\n"
+        f"SENDER         : {author}\n"
+        "LOCATION       : DIRECT MESSAGE\n"
+        "CLEARANCE      : USER-LEVEL\n"
+        "\n"
+        "INCOMING PACKET\n"
+        f"  Characters   : {content_len}\n"
+        f"  Words        : {word_count}\n"
+        f"  Entropy Est. : {round(random.random(), 4)}\n"
+        "\n"
+        "SYSTEM TELEMETRY\n"
+        f"  Uptime       : {uptime} seconds\n"
+        f"  Latency      : {latency_ms} ms\n"
+        f"  Servers      : {server_count}\n"
+        f"  TrackedUsers : {user_count}\n"
+        "\n"
+        "ENGINE STATUS\n"
+        "  XP Engine    : STANDBY (DM MODE)\n"
+        "  Dice Engine  : ARMED\n"
+        "  Achievements : OBSERVABLE\n"
+        "\n"
+        "NARRATOR (V.O.)\n"
+        "  The signal arrives without witnesses.\n"
+        "  The machine acknowledges receipt.\n"
+        "\n"
+        "NEXT ACTIONS\n"
+        "  +help        → enumerate affordances\n"
+        "  +roll d20    → invoke probability\n"
+        "  +masterbot   → breach containment\n"
+        "--------------------------------\n"
+        "END LOG\n"
+        "```"
+    )
+
+
 # ----------------------------
 # RPG math
 # ----------------------------
@@ -807,6 +865,7 @@ async def starwars_cmd(ctx: commands.Context) -> None:
 @bot.event
 async def on_ready() -> None:
     logger.warning("MasterBot is now active")
+    bot.launch_time = time.time()
     activity = discord.Game(name="Chapter One: Shall We Play A Game?")
     await bot.change_presence(status=discord.Status.idle, activity=activity)
 
@@ -831,17 +890,12 @@ async def on_message(message: discord.Message) -> None:
 
     # DM behavior: respond politely + allow commands
     if message.guild is None:
-        # If it's a command, let it process normally.
         if message.content.strip().startswith("+"):
             await bot.process_commands(message)
             return
 
-        # Otherwise: a tiny DM acknowledgement.
         try:
-            await message.channel.send(
-                "DM received. Commands work here too.\n"
-                "Try `+help` or (dangerous) `+masterbot`."
-            )
+            await message.channel.send(dm_screenplay_log(message))
         except Exception:
             pass
         return
