@@ -201,6 +201,52 @@ class SolEngine:
 
         return vectors
 
+    def _summarize_file_text(self, path: str, text: str) -> str:
+        trimmed = text.strip()
+        if not trimmed:
+            return ""
+
+        excerpt = trimmed[:14000]
+        prompt = (
+            "Create a concise, complete summary of this file for semantic retrieval. "
+            "Capture major themes, key entities, mechanics, and important constraints. "
+            "Do not fabricate details and do not include markdown formatting."
+        )
+
+        try:
+            if hasattr(self.client, "responses"):
+                resp = self.client.responses.create(
+                    model="gpt-4.1-mini",
+                    input=[
+                        {"role": "system", "content": [{"type": "input_text", "text": prompt}]},
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": f"Path: {path}\n\nFile text:\n{excerpt}"}],
+                        },
+                    ],
+                    temperature=0.2,
+                )
+                summary = (resp.output_text or "").strip()
+                if summary:
+                    return summary
+            else:
+                resp = self.client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": f"Path: {path}\n\nFile text:\n{excerpt}"},
+                    ],
+                    temperature=0.2,
+                )
+                content = resp.choices[0].message.content if resp.choices else ""
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+        except Exception:
+            logger.warning(f"SOL:  Summary generation failed for {path}; using fallback.", exc_info=True)
+
+        fallback = " ".join(trimmed.split())
+        return fallback[:900]
+
     def _build_index_sync(self) -> None:
         start_time = time.time()
         logger.info("SOL: Starting index build...")
@@ -236,34 +282,54 @@ class SolEngine:
             cache_entry = cache_docs.get(path)
             if cache_entry and float(cache_entry.get("mtime", 0.0)) == float(mtime):
                 cache_hits += 1
-                chunk_count = len(cache_entry.get("chunks", []))
+                cached_entries = cache_entry.get("entries") or cache_entry.get("chunks", [])
+                chunk_count = len(cached_entries)
                 total_chunks += chunk_count
-                logger.info(f"SOL:  Cache hit ({chunk_count} chunks)")
-                for item in cache_entry.get("chunks", []):
+                logger.info(f"SOL:  Cache hit ({chunk_count} embeddings)")
+                for item in cached_entries:
                     new_docs.append(item["doc"])
                     new_embeddings.append(item["embedding"])
                 continue
 
             cache_misses += 1
+            summary = self._summarize_file_text(path, text)
             chunks = self._chunk_text(text, chunk_size=self.chunk_size)
-            logger.info(f"SOL:  Cache miss → {len(chunks)} new chunks")
-            if not chunks:
+            logger.info(f"SOL:  Cache miss → summary + {len(chunks)} chunks")
+            if not summary and not chunks:
                 continue
-            chunk_embeddings = self._embed_texts(chunks)
-            total_chunks += len(chunks)
-            packaged_chunks = []
-            for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+
+            texts_to_embed = ([summary] if summary else []) + chunks
+            text_embeddings = self._embed_texts(texts_to_embed)
+            total_chunks += len(texts_to_embed)
+            packaged_entries = []
+
+            emb_offset = 0
+            if summary:
+                summary_emb = text_embeddings[0]
+                emb_offset = 1
+                summary_doc = {
+                    "path": path,
+                    "chunk_index": "summary",
+                    "text": summary,
+                    "id": hashlib.sha1(f"{path}:summary:{len(summary)}".encode("utf-8")).hexdigest()[:12],
+                }
+                packaged_entries.append({"doc": summary_doc, "embedding": summary_emb})
+                new_docs.append(summary_doc)
+                new_embeddings.append(summary_emb)
+                logger.info(f"SOL:  Summary generated ({len(summary)} chars)")
+
+            for idx, (chunk, emb) in enumerate(zip(chunks, text_embeddings[emb_offset:])):
                 doc = {
                     "path": path,
                     "chunk_index": idx,
                     "text": chunk,
                     "id": hashlib.sha1(f"{path}:{idx}:{len(chunk)}".encode("utf-8")).hexdigest()[:12],
                 }
-                packaged_chunks.append({"doc": doc, "embedding": emb})
+                packaged_entries.append({"doc": doc, "embedding": emb})
                 new_docs.append(doc)
                 new_embeddings.append(emb)
 
-            cache_docs[path] = {"mtime": mtime, "chunks": packaged_chunks}
+            cache_docs[path] = {"mtime": mtime, "summary": summary, "entries": packaged_entries}
 
         valid_paths = {path for path, _, _ in corpus}
         for stale in list(cache_docs.keys()):
