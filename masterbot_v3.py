@@ -64,7 +64,7 @@ logger.addHandler(file_handler)
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 logger.addHandler(console_handler)
 
 # ----------------------------
@@ -1134,15 +1134,36 @@ async def sol_cmd(ctx: commands.Context, *, question: str) -> None:
     +sol how does my myth-state look?
     """
     if not question.strip():
+        logger.debug("SOL rejected empty question from user_id=%s", ctx.author.id)
         await ctx.send("Usage: `+sol <question>`")
         return
 
     if not sol_engine.index_ready:
+        logger.info(
+            "SOL requested before index ready: user_id=%s guild_id=%s channel_id=%s question=%r",
+            ctx.author.id,
+            ctx.guild.id if ctx.guild else None,
+            ctx.channel.id,
+            question[:120],
+        )
         await ctx.send("SOL index is warming up. Try again in a moment.")
         return
 
     try:
+        logger.debug(
+            "SOL request started: user_id=%s guild_id=%s channel_id=%s mode=%s question=%r",
+            ctx.author.id,
+            ctx.guild.id if ctx.guild else None,
+            ctx.channel.id,
+            _sol_get_mode(int(ctx.author.id)),
+            question[:240],
+        )
         answer = await _sol_generate_response(ctx, question)
+        logger.debug(
+            "SOL request completed: user_id=%s answer_chars=%s",
+            ctx.author.id,
+            len(answer),
+        )
         await ctx.send(answer[:1900])
     except Exception as e:
         logger.exception("SOL response failed")
@@ -1246,6 +1267,7 @@ async def on_message(message: discord.Message) -> None:
     # DM behavior: respond politely + allow commands
     if message.guild is None:
         if message.content.strip().startswith("+"):
+            logger.debug("Processing DM command from user_id=%s content=%r", message.author.id, message.content[:200])
             await bot.process_commands(message)
             return
 
@@ -1264,15 +1286,30 @@ async def on_message(message: discord.Message) -> None:
     #     return
 
     try:
+        logger.debug(
+            "Updating XP: guild_id=%s user_id=%s message_chars=%s",
+            message.guild.id,
+            message.author.id,
+            len(message.content),
+        )
         await update_xp_from_message(
             message.guild,
             message.author,
             str(message.content).lower(),
             message.channel,
         )
+        logger.debug("XP update succeeded: guild_id=%s user_id=%s", message.guild.id, message.author.id)
     except Exception:
         logger.exception("XP update failed (continuing anyway)")
 
+    if message.content.strip().startswith("+"):
+        logger.debug(
+            "Processing guild command candidate: guild_id=%s channel_id=%s user_id=%s content=%r",
+            message.guild.id,
+            message.channel.id,
+            message.author.id,
+            message.content[:200],
+        )
     await bot.process_commands(message)
 
 
