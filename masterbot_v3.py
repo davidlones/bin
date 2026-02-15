@@ -624,16 +624,38 @@ async def _sol_generate_response(ctx: commands.Context, question: str) -> str:
     )
 
     def _call_responses() -> str:
-        resp = openai_client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {"role": "system", "content": [{"type": "input_text", "text": sys_text}]},
-                {"role": "system", "content": [{"type": "input_text", "text": mode_map.get(mode, mode_map['normal'])}]},
-                {"role": "user", "content": [{"type": "input_text", "text": input_text}]},
+        model = "gpt-4.1-mini"
+        style_text = mode_map.get(mode, mode_map["normal"])
+
+        # Prefer Responses API, but fall back to Chat Completions for older SDKs.
+        if hasattr(openai_client, "responses"):
+            resp = openai_client.responses.create(
+                model=model,
+                input=[
+                    {"role": "system", "content": [{"type": "input_text", "text": sys_text}]},
+                    {"role": "system", "content": [{"type": "input_text", "text": style_text}]},
+                    {"role": "user", "content": [{"type": "input_text", "text": input_text}]},
+                ],
+                temperature=0.6,
+            )
+            return (resp.output_text or "").strip()
+
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_text},
+                {"role": "system", "content": style_text},
+                {"role": "user", "content": input_text},
             ],
             temperature=0.6,
         )
-        return (resp.output_text or "").strip()
+        content = resp.choices[0].message.content if resp.choices else ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = [item.get("text", "") for item in content if isinstance(item, dict)]
+            return "\n".join(part for part in parts if part).strip()
+        return ""
 
     answer = await asyncio.to_thread(_call_responses)
     _sol_append_history(int(ctx.author.id), scope, "user", question)
