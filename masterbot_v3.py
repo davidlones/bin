@@ -30,9 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import os
-import pickle
 import random
 import re
 import shelve
@@ -43,9 +41,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
-from openai import OpenAI
-
-import sol
 
 # ----------------------------
 # Logging
@@ -103,18 +98,6 @@ intents.message_content = True
 intents.members = True  # for mentions/user objects; safe default
 
 bot = commands.Bot(command_prefix="+", intents=intents, help_command=None)
-
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-SOL_EMBED_CACHE_PATH = LOG_DIR / "sol_embeddings_v2.pkl"
-SOL_KNOWLEDGE_EXTENSIONS = {".py", ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini"}
-SOL_MAX_FILE_BYTES = 180_000
-SOL_MAX_CHUNKS_PER_FILE = 6
-SOL_TOP_K_MATCHES = 6
-
-sol_embedding_index: Dict[str, Tuple[int, List[float], float, str, str]] = {}
-sol_embeddings_loaded = False
-sol_embedding_lock = asyncio.Lock()
 
 # ----------------------------
 # Presence rotation
@@ -275,102 +258,6 @@ def dm_screenplay_log(message: discord.Message) -> str:
         "END LOG\n"
         "```"
     )
-
-
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return -1.0
-    dot = sum(a * b for a, b in zip(vec_a, vec_b))
-    norm_a = math.sqrt(sum(a * a for a in vec_a))
-    norm_b = math.sqrt(sum(b * b for b in vec_b))
-    if norm_a == 0 or norm_b == 0:
-        return -1.0
-    return dot / (norm_a * norm_b)
-
-
-def _build_sol_embedding_index_sync() -> Dict[str, Tuple[int, List[float], float, str, str]]:
-    index: Dict[str, Tuple[int, List[float], float, str, str]] = {}
-
-    try:
-        cached = {}
-        if SOL_EMBED_CACHE_PATH.exists():
-            with SOL_EMBED_CACHE_PATH.open("rb") as fh:
-                cached = pickle.load(fh)
-    except Exception:
-        cached = {}
-
-    files = sol.get_all_files(
-        exclude_dirs=["./.git", "./logs", "./venv", "./.venv", "./node_modules"],
-        extensions=list(SOL_KNOWLEDGE_EXTENSIONS),
-        recursive=True,
-        verbose=False,
-    )
-
-    for filepath in files:
-        path = Path(filepath)
-        if not path.exists() or path.suffix.lower() not in SOL_KNOWLEDGE_EXTENSIONS:
-            continue
-        try:
-            if path.stat().st_size > SOL_MAX_FILE_BYTES:
-                continue
-            content = path.read_text(encoding="utf-8", errors="ignore")
-            mtime = path.stat().st_mtime
-        except Exception:
-            continue
-
-        chunks = sol.chunk_text(content, chunk_size=1000)[:SOL_MAX_CHUNKS_PER_FILE]
-        for chunk_index, chunk in enumerate(chunks):
-            cleaned_chunk = chunk.strip()
-            if not cleaned_chunk:
-                continue
-
-            key = f"{filepath}:{chunk_index}"
-            cached_entry = cached.get(key)
-            if cached_entry and isinstance(cached_entry, tuple) and len(cached_entry) == 5 and cached_entry[2] == mtime:
-                index[key] = cached_entry
-                continue
-
-            emb_response = openai_client.embeddings.create(
-                model="text-embedding-3-small",
-                input=cleaned_chunk,
-            )
-            embedding = emb_response.data[0].embedding
-            index[key] = (chunk_index, embedding, mtime, cleaned_chunk, filepath)
-
-    try:
-        with SOL_EMBED_CACHE_PATH.open("wb") as fh:
-            pickle.dump(index, fh)
-    except Exception:
-        logger.exception("Failed to persist SOL embedding cache")
-
-    return index
-
-
-def _semantic_context_sync(question: str, top_k: int = SOL_TOP_K_MATCHES) -> str:
-    if not sol_embedding_index:
-        return "(No SOL knowledge base embeddings are loaded yet.)"
-
-    query_response = openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=question,
-    )
-    query_embedding = query_response.data[0].embedding
-
-    scored_chunks = []
-    for chunk_index, chunk_embedding, _mtime, chunk_text, filepath in sol_embedding_index.values():
-        score = _cosine_similarity(query_embedding, chunk_embedding)
-        scored_chunks.append((score, filepath, chunk_index, chunk_text))
-
-    scored_chunks.sort(key=lambda item: item[0], reverse=True)
-    selected = scored_chunks[:top_k]
-
-    if not selected:
-        return "(No relevant SOL context matches found.)"
-
-    parts = []
-    for score, filepath, chunk_index, chunk_text in selected:
-        parts.append(f"[{Path(filepath).name}#{chunk_index} score={score:.3f}] {chunk_text[:900]}")
-    return "\n\n".join(parts)
 
 
 # ----------------------------
@@ -680,83 +567,9 @@ async def help_cmd(ctx: commands.Context) -> None:
         "**+setstats STR DEX CON INT WIS CHA [@user]**\n"
         "**+hp <delta> [@user] [hitroll]**   (delta negative = damage, positive = heal)\n"
         "**+dm @user <message>**\n"
-        "**+sol <question>**   (SOL conversational mode with semantic context)\n"
         "**+starwars**   (if ./bin/sw1.txt exists)\n"
     )
     await ctx.send(msg)
-
-
-@bot.command(name="sol")
-async def sol_cmd(ctx: commands.Context, *, question: str) -> None:
-    prompt = (question or "").strip()
-    if not prompt:
-        await ctx.send("Usage: `+sol <question>`")
-        return
-
-    if not os.getenv("OPENAI_API_KEY", "").strip():
-        await ctx.send("SOL is unavailable right now: OPENAI_API_KEY is not configured.")
-        return
-
-    global sol_embedding_index, sol_embeddings_loaded
-
-    async with sol_embedding_lock:
-        if not sol_embeddings_loaded:
-            try:
-                sol_embedding_index = await asyncio.to_thread(_build_sol_embedding_index_sync)
-                sol_embeddings_loaded = True
-            except Exception:
-                logger.exception("SOL embedding preload failed")
-                await ctx.send("SOL failed to initialize its knowledge base cache.")
-                return
-
-    try:
-        semantic_context = await asyncio.to_thread(_semantic_context_sync, prompt)
-    except Exception:
-        logger.exception("SOL semantic search failed")
-        semantic_context = "(Semantic context lookup failed; proceed using general model knowledge.)"
-
-    newrules = False
-    level = 0
-    xp = 1
-    achievements: List[str] = []
-    if ctx.guild:
-        with _open_db() as db:
-            server_bucket = _get_server_bucket(db, ctx.guild.id)
-            user_bucket = _get_user_bucket(server_bucket, int(ctx.author.id))
-            newrules = bool(server_bucket.get("newrules", False))
-            level = int(user_bucket.get("level", 0))
-            xp = int(user_bucket.get("xp", 1))
-            achievements = list(user_bucket.get("achievements", []))
-
-    transmigration = "TRANSMIGRATION" in achievements
-    system_msg = (
-        "You are SOL, an in-world conversational intelligence embedded in MasterBot. "
-        "Speak clearly, be helpful, and preserve a slightly mythic/arcane tone when it fits. "
-        "If context is missing, say so briefly instead of fabricating specifics.\n\n"
-        f"Server state: newrules={newrules}.\n"
-        f"User state: level={level}, xp={xp}, achievements={achievements}.\n"
-        f"TRANSMIGRATION unlocked={transmigration}.\n\n"
-        "Knowledge base excerpts retrieved via embeddings:\n"
-        f"{semantic_context}\n"
-    )
-
-    try:
-        response = await asyncio.to_thread(
-            openai_client.chat.completions.create,
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=500,
-        )
-        answer = response.choices[0].message.content if response.choices else None
-        if not answer:
-            answer = "I couldn't produce a reply just now. Please try again."
-        await ctx.send(answer)
-    except Exception as e:
-        logger.exception("SOL completion failed")
-        await ctx.send(f"SOL encountered an API error: `{e}`")
 
 
 @bot.command(name="masterbot")
@@ -1055,16 +868,6 @@ async def on_ready() -> None:
     bot.launch_time = time.time()
     activity = discord.Game(name="Chapter One: Shall We Play A Game?")
     await bot.change_presence(status=discord.Status.idle, activity=activity)
-
-    global sol_embedding_index, sol_embeddings_loaded
-    async with sol_embedding_lock:
-        if not sol_embeddings_loaded:
-            try:
-                sol_embedding_index = await asyncio.to_thread(_build_sol_embedding_index_sync)
-                sol_embeddings_loaded = True
-                logger.info("SOL embeddings preloaded: %s chunks", len(sol_embedding_index))
-            except Exception:
-                logger.exception("SOL embeddings failed to preload on startup")
 
     if not rotate_presence.is_running():
         rotate_presence.start()
