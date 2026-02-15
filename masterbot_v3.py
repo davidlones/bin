@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # ----------------------------
 # Logging
@@ -98,6 +98,35 @@ intents.message_content = True
 intents.members = True  # for mentions/user objects; safe default
 
 bot = commands.Bot(command_prefix="+", intents=intents, help_command=None)
+
+# ----------------------------
+# Presence rotation
+# ----------------------------
+PRESENCE_GAMES = [
+    "Global Thermonuclear War",
+    "Signal Analysis",
+    "Strategic Simulation",
+    "Cold Silence",
+    "Stack Trace Review",
+]
+
+PRESENCE_SUFFIXES = [
+    "",
+    " (idle)",
+    " // awaiting input",
+    " // observing",
+    " // calculating",
+]
+
+
+@tasks.loop(seconds=600)
+async def rotate_presence() -> None:
+    game = random.choice(PRESENCE_GAMES)
+    suffix = random.choice(PRESENCE_SUFFIXES)
+
+    activity = discord.Game(name=f"{game}{suffix}")
+    await bot.change_presence(activity=activity)
+    logger.info(f"Presence changed to: {game}{suffix}")
 
 # ----------------------------
 # Helpers
@@ -778,8 +807,11 @@ async def starwars_cmd(ctx: commands.Context) -> None:
 @bot.event
 async def on_ready() -> None:
     logger.warning("MasterBot is now active")
-    activity = discord.Game(name="recompiling")
+    activity = discord.Game(name="Chapter One: Shall We Play A Game?")
     await bot.change_presence(status=discord.Status.idle, activity=activity)
+
+    if not rotate_presence.is_running():
+        rotate_presence.start()
 
 
 @bot.event
