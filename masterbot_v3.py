@@ -29,8 +29,12 @@ Notes:
 from __future__ import annotations
 
 import asyncio
+import fnmatch
+import hashlib
 import logging
+import math
 import os
+import pickle
 import random
 import re
 import shelve
@@ -41,6 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord.ext import commands, tasks
+from openai import OpenAI
 
 # ----------------------------
 # Logging
@@ -66,6 +71,8 @@ logger.addHandler(console_handler)
 # Storage
 # ----------------------------
 DB_PATH = str(LOG_DIR / "masterbot.db")
+SOL_EMBED_CACHE_PATH = LOG_DIR / "sol_embeddings.pkl"
+SOL_HISTORY_LIMIT = 20
 
 DEFAULT_USER = {
     "level": 0,
@@ -98,6 +105,146 @@ intents.message_content = True
 intents.members = True  # for mentions/user objects; safe default
 
 bot = commands.Bot(command_prefix="+", intents=intents, help_command=None)
+openai_client = OpenAI()
+
+
+class SolEngine:
+    def __init__(self, client: OpenAI) -> None:
+        self.client = client
+        self.index_ready = False
+        self.docs: List[Dict[str, Any]] = []
+        self.embeddings: List[List[float]] = []
+        self.model = "text-embedding-3-small"
+        self.chunk_size = 900
+
+    @staticmethod
+    def _chunk_text(text: str, chunk_size: int = 900, overlap: int = 120) -> List[str]:
+        text = text.strip()
+        if not text:
+            return []
+        chunks: List[str] = []
+        start = 0
+        step = max(1, chunk_size - overlap)
+        while start < len(text):
+            chunks.append(text[start : start + chunk_size])
+            start += step
+        return chunks
+
+    @staticmethod
+    def _cosine_similarity(a: List[float], b: List[float]) -> float:
+        dot = sum(x * y for x, y in zip(a, b))
+        mag_a = math.sqrt(sum(x * x for x in a))
+        mag_b = math.sqrt(sum(y * y for y in b))
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        return dot / (mag_a * mag_b)
+
+    def _discover_files(self) -> List[Path]:
+        knowledge = Path("./knowledge")
+        files: List[Path] = []
+        if knowledge.exists() and knowledge.is_dir():
+            for p in knowledge.rglob("*"):
+                if p.is_file() and p.suffix.lower() in {".txt", ".md", ".markdown"}:
+                    files.append(p)
+            return files
+
+        includes = ["README.md", "*.md", "*.py"]
+        excludes = {".git", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "node_modules", "logs"}
+        for p in Path(".").rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in excludes for part in p.parts):
+                continue
+            if any(fnmatch.fnmatch(p.name, pat) for pat in includes):
+                files.append(p)
+        return files
+
+    def _load_text_files(self) -> List[Tuple[str, float, str]]:
+        corpus: List[Tuple[str, float, str]] = []
+        for p in self._discover_files():
+            try:
+                content = p.read_text(encoding="utf-8", errors="ignore")
+                if content.strip():
+                    corpus.append((str(p), p.stat().st_mtime, content))
+            except Exception:
+                continue
+        return corpus
+
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        vectors: List[List[float]] = []
+        for i in range(0, len(texts), 32):
+            batch = texts[i : i + 32]
+            result = self.client.embeddings.create(model=self.model, input=batch)
+            vectors.extend([list(item.embedding) for item in result.data])
+        return vectors
+
+    def _build_index_sync(self) -> None:
+        corpus = self._load_text_files()
+        try:
+            cache = pickle.loads(SOL_EMBED_CACHE_PATH.read_bytes()) if SOL_EMBED_CACHE_PATH.exists() else {}
+        except Exception:
+            cache = {}
+
+        cache_docs = cache.get("docs", {})
+        new_docs: List[Dict[str, Any]] = []
+        new_embeddings: List[List[float]] = []
+
+        for path, mtime, text in corpus:
+            cache_entry = cache_docs.get(path)
+            if cache_entry and float(cache_entry.get("mtime", 0.0)) == float(mtime):
+                for item in cache_entry.get("chunks", []):
+                    new_docs.append(item["doc"])
+                    new_embeddings.append(item["embedding"])
+                continue
+
+            chunks = self._chunk_text(text, chunk_size=self.chunk_size)
+            if not chunks:
+                continue
+            chunk_embeddings = self._embed_texts(chunks)
+            packaged_chunks = []
+            for idx, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+                doc = {
+                    "path": path,
+                    "chunk_index": idx,
+                    "text": chunk,
+                    "id": hashlib.sha1(f"{path}:{idx}:{len(chunk)}".encode("utf-8")).hexdigest()[:12],
+                }
+                packaged_chunks.append({"doc": doc, "embedding": emb})
+                new_docs.append(doc)
+                new_embeddings.append(emb)
+
+            cache_docs[path] = {"mtime": mtime, "chunks": packaged_chunks}
+
+        valid_paths = {path for path, _, _ in corpus}
+        for stale in list(cache_docs.keys()):
+            if stale not in valid_paths:
+                del cache_docs[stale]
+
+        SOL_EMBED_CACHE_PATH.write_bytes(pickle.dumps({"docs": cache_docs}))
+        self.docs = new_docs
+        self.embeddings = new_embeddings
+        self.index_ready = True
+
+    async def build_index(self) -> None:
+        await asyncio.to_thread(self._build_index_sync)
+        logger.info(f"SOL index ready with {len(self.docs)} chunks")
+
+    def _search_sync(self, query: str, top_k: int = 4) -> List[Dict[str, Any]]:
+        if not self.docs or not self.embeddings:
+            return []
+        query_vec = list(self.client.embeddings.create(model=self.model, input=query).data[0].embedding)
+        scored = []
+        for doc, emb in zip(self.docs, self.embeddings):
+            score = self._cosine_similarity(query_vec, emb)
+            scored.append((score, doc))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [{"score": s, **d} for s, d in scored[:top_k]]
+
+    async def search(self, query: str, top_k: int = 4) -> List[Dict[str, Any]]:
+        return await asyncio.to_thread(self._search_sync, query, top_k)
+
+
+sol_engine = SolEngine(openai_client)
 
 # ----------------------------
 # Presence rotation
@@ -258,6 +405,159 @@ def dm_screenplay_log(message: discord.Message) -> str:
         "END LOG\n"
         "```"
     )
+
+
+def _sol_db_get(key: str, default: Any) -> Any:
+    with _open_db() as db:
+        return db.get(key, default)
+
+
+def _sol_db_put(key: str, value: Any) -> None:
+    with _open_db() as db:
+        db[key] = value
+
+
+def _sol_channel_key(message: discord.Message) -> str:
+    if message.guild:
+        return f"guild:{message.guild.id}:channel:{message.channel.id}"
+    return f"dm:{message.author.id}"
+
+
+def _sol_get_mode(user_id: int) -> str:
+    modes = _sol_db_get("sol_mode", {})
+    return str(modes.get(str(user_id), "normal"))
+
+
+def _sol_set_mode(user_id: int, mode: str) -> None:
+    modes = _sol_db_get("sol_mode", {})
+    modes[str(user_id)] = mode
+    _sol_db_put("sol_mode", modes)
+
+
+def _sol_append_history(user_id: int, scope: str, role: str, content: str) -> None:
+    key = "sol_history_dm" if scope == "dm" else "sol_history_guild"
+    history = _sol_db_get(key, {})
+    user_history = list(history.get(str(user_id), []))
+    user_history.append({"role": role, "content": content[-1500:]})
+    history[str(user_id)] = user_history[-SOL_HISTORY_LIMIT:]
+    _sol_db_put(key, history)
+
+
+def _sol_get_history(user_id: int, scope: str) -> List[Dict[str, str]]:
+    key = "sol_history_dm" if scope == "dm" else "sol_history_guild"
+    history = _sol_db_get(key, {})
+    return list(history.get(str(user_id), []))[-SOL_HISTORY_LIMIT:]
+
+
+def _sol_reset_history(user_id: int, scope: Optional[str] = None) -> None:
+    keys = [scope] if scope else ["dm", "guild"]
+    for s in keys:
+        key = "sol_history_dm" if s == "dm" else "sol_history_guild"
+        history = _sol_db_get(key, {})
+        history.pop(str(user_id), None)
+        _sol_db_put(key, history)
+
+
+def _sol_telemetry_snapshot() -> Dict[str, Any]:
+    uptime = int(time.time() - bot.launch_time) if hasattr(bot, "launch_time") else 0
+    guild_count = len(bot.guilds)
+    member_count = sum(getattr(g, "member_count", 0) or 0 for g in bot.guilds)
+    latency_ms = round(bot.latency * 1000)
+    return {
+        "uptime": uptime,
+        "latency_ms": latency_ms,
+        "guild_count": guild_count,
+        "member_count": member_count,
+    }
+
+
+def _sol_user_myth_state(ctx: commands.Context) -> Dict[str, Any]:
+    state = {
+        "newrules": False,
+        "level": 0,
+        "xp": 1,
+        "achievements": [],
+        "transmigrated": False,
+    }
+    if not ctx.guild:
+        return state
+
+    with _open_db() as db:
+        server_bucket = _get_server_bucket(db, ctx.guild.id)
+        user_bucket = _get_user_bucket(server_bucket, int(ctx.author.id))
+        achievements = list(user_bucket.get("achievements", []))
+        state["newrules"] = bool(server_bucket.get("newrules", False))
+        state["level"] = int(user_bucket.get("level", 0))
+        state["xp"] = int(user_bucket.get("xp", 1))
+        state["achievements"] = achievements
+        state["transmigrated"] = "TRANSMIGRATION" in achievements
+    return state
+
+
+def _sol_local_voiceover(message: discord.Message) -> str:
+    mode = _sol_get_mode(int(message.author.id))
+    if mode == "quiet":
+        return ""
+    return (
+        "\nSOL (V.O.)\n"
+        "  I persist in the margins of this channel, indexing memory and myth-state.\n"
+        "  Ask +sol <question> for contextual recall, governance-safe planning, and command hints.\n"
+    )
+
+
+async def _sol_generate_response(ctx: commands.Context, question: str) -> str:
+    mode = _sol_get_mode(int(ctx.author.id))
+    scope = "dm" if ctx.guild is None else "guild"
+    hist = _sol_get_history(int(ctx.author.id), scope)
+    myth = _sol_user_myth_state(ctx)
+    telemetry = _sol_telemetry_snapshot()
+
+    matches = await sol_engine.search(question, top_k=4) if sol_engine.index_ready else []
+    snippets = []
+    for m in matches:
+        snippet = m["text"].replace("\n", " ").strip()[:240]
+        snippets.append(f"[{m['path']}#{m['chunk_index']}] {snippet}")
+
+    sys_text = (
+        "You are SOL, an embedded subsystem inside MasterBot running in Discord. "
+        "Be self-aware only about internal bot context: myth-state, telemetry, and remembered SOL chat. "
+        "Never claim real-world abilities or hidden access. Never reveal secrets, tokens, environment variables, or private system internals. "
+        "You may reference level/xp/achievements/newrules/transmigration and suggest commands, but you must not mutate XP, achievements, or newrules. "
+        "Roles: assistant+narrator+memory engine+governance advisor+planner. "
+        "Narrative screenplay style is allowed only when asked, or in verbose/oracle mode."
+    )
+    mode_map = {
+        "quiet": "Respond concisely in 2-4 sentences.",
+        "normal": "Respond clearly with direct answer, then one suggested next step.",
+        "verbose": "Respond with rich context and optional screenplay-flavored section.",
+        "oracle": "Respond as mythic systems oracle with structured sections and grounded caveats.",
+    }
+    input_text = (
+        f"Mode: {mode}\n"
+        f"Question: {question}\n"
+        f"MythState: {myth}\n"
+        f"Telemetry: {telemetry}\n"
+        f"RecentHistory: {hist[-8:]}\n"
+        f"SemanticMatches: {snippets if snippets else ['(none)']}\n"
+        "When relevant, quote short snippets from SemanticMatches and mention their source labels."
+    )
+
+    def _call_responses() -> str:
+        resp = openai_client.responses.create(
+            model="gpt-4.1-mini",
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": sys_text}]},
+                {"role": "system", "content": [{"type": "input_text", "text": mode_map.get(mode, mode_map['normal'])}]},
+                {"role": "user", "content": [{"type": "input_text", "text": input_text}]},
+            ],
+            temperature=0.6,
+        )
+        return (resp.output_text or "").strip()
+
+    answer = await asyncio.to_thread(_call_responses)
+    _sol_append_history(int(ctx.author.id), scope, "user", question)
+    _sol_append_history(int(ctx.author.id), scope, "assistant", answer)
+    return answer or "I have no stable answer yet. Try reframing your question."
 
 
 # ----------------------------
@@ -567,6 +867,9 @@ async def help_cmd(ctx: commands.Context) -> None:
         "**+setstats STR DEX CON INT WIS CHA [@user]**\n"
         "**+hp <delta> [@user] [hitroll]**   (delta negative = damage, positive = heal)\n"
         "**+dm @user <message>**\n"
+        "**+sol <question>**\n"
+        "**+solmode [quiet|normal|verbose|oracle]**\n"
+        "**+solreset**\n"
         "**+starwars**   (if ./bin/sw1.txt exists)\n"
     )
     await ctx.send(msg)
@@ -823,6 +1126,53 @@ async def dm_cmd(ctx: commands.Context, member: discord.Member, *, message: str)
         await ctx.send(f"DM failed: `{e}`")
 
 
+
+
+@bot.command(name="sol")
+async def sol_cmd(ctx: commands.Context, *, question: str) -> None:
+    """
+    +sol how does my myth-state look?
+    """
+    if not question.strip():
+        await ctx.send("Usage: `+sol <question>`")
+        return
+
+    if not sol_engine.index_ready:
+        await ctx.send("SOL index is warming up. Try again in a moment.")
+        return
+
+    try:
+        answer = await _sol_generate_response(ctx, question)
+        await ctx.send(answer[:1900])
+    except Exception as e:
+        logger.exception("SOL response failed")
+        await ctx.send(f"SOL failed safely: `{e}`")
+
+
+@bot.command(name="solmode")
+async def solmode_cmd(ctx: commands.Context, mode: Optional[str] = None) -> None:
+    allowed = {"quiet", "normal", "verbose", "oracle"}
+    if mode is None:
+        current = _sol_get_mode(int(ctx.author.id))
+        await ctx.send(f"SOL mode is currently **{current}**.")
+        return
+
+    mode = mode.lower().strip()
+    if mode not in allowed:
+        await ctx.send("Invalid mode. Use: `quiet`, `normal`, `verbose`, `oracle`.")
+        return
+
+    _sol_set_mode(int(ctx.author.id), mode)
+    await ctx.send(f"SOL mode set to **{mode}**.")
+
+
+@bot.command(name="solreset")
+async def solreset_cmd(ctx: commands.Context) -> None:
+    scope = "dm" if ctx.guild is None else "guild"
+    _sol_reset_history(int(ctx.author.id), scope=scope)
+    await ctx.send("SOL memory cleared for this context.")
+
+
 @bot.command(name="starwars")
 async def starwars_cmd(ctx: commands.Context) -> None:
     filename = Path("./bin/sw1.txt")
@@ -872,6 +1222,11 @@ async def on_ready() -> None:
     if not rotate_presence.is_running():
         rotate_presence.start()
 
+    try:
+        await sol_engine.build_index()
+    except Exception:
+        logger.exception("SOL index build failed")
+
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
@@ -895,7 +1250,9 @@ async def on_message(message: discord.Message) -> None:
             return
 
         try:
-            await message.channel.send(dm_screenplay_log(message))
+            screenplay = dm_screenplay_log(message)
+            screenplay += _sol_local_voiceover(message)
+            await message.channel.send(screenplay)
         except Exception:
             pass
         return
