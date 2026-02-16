@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextlib
+import datetime
 import hashlib
 import logging
 import math
@@ -39,6 +39,8 @@ import pickle
 import random
 import re
 import shelve
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -380,47 +382,295 @@ class SolEngine:
 sol_engine = SolEngine(openai_client)
 
 # ----------------------------
-# Presence rotation
+# Presence system
 # ----------------------------
-PRESENCE_GAMES = [
-    "Global Thermonuclear War",
-    "Signal Analysis",
-    "Strategic Simulation",
-    "Cold Silence",
-    "Stack Trace Review",
-]
+@dataclass(frozen=True)
+class PresenceTelemetry:
+    load_avg_1m: float
+    memory_used_pct: Optional[float]
+    disk_used_pct: float
+    pending_updates: int
+    active_ssh_sessions: int
+    failed_login_attempts_24h: int
+    reconnect_events: int
+    log_error_count_1h: int
 
-PRESENCE_SUFFIXES = [
-    "",
-    " (idle)",
-    " // awaiting input",
-    " // observing",
-    " // calculating",
-]
+
+class RuntimeCounters:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reconnect_timestamps: List[float] = []
+
+    def note_reconnect(self) -> None:
+        with self._lock:
+            self.reconnect_timestamps.append(time.time())
+
+    def reconnects_last_hour(self) -> int:
+        cutoff = time.time() - 3600
+        with self._lock:
+            self.reconnect_timestamps = [ts for ts in self.reconnect_timestamps if ts >= cutoff]
+            return len(self.reconnect_timestamps)
+
+
+runtime_counters = RuntimeCounters()
+
+
+class PresenceTelemetryCollector:
+    @staticmethod
+    def _memory_used_pct() -> Optional[float]:
+        meminfo = Path("/proc/meminfo")
+        if not meminfo.exists():
+            return None
+
+        values: Dict[str, int] = {}
+        for line in meminfo.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split(":", 1)
+            if len(parts) != 2:
+                continue
+            key = parts[0].strip()
+            match = re.search(r"(\d+)", parts[1])
+            if match:
+                values[key] = int(match.group(1))
+
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        if not total or available is None:
+            return None
+
+        used = max(0, total - available)
+        return round((used / total) * 100, 1)
+
+    @staticmethod
+    def _disk_used_pct() -> float:
+        usage = shutil.disk_usage("/")
+        return round((usage.used / usage.total) * 100, 1)
+
+    @staticmethod
+    def _pending_updates() -> int:
+        apt_lists = Path("/var/lib/apt/lists")
+        if not apt_lists.exists():
+            return 0
+        try:
+            result = subprocess.run(
+                ["apt", "list", "--upgradable"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+            if result.returncode != 0:
+                return 0
+            lines = [ln for ln in result.stdout.splitlines() if ln and not ln.startswith("Listing...")]
+            return len(lines)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _active_ssh_sessions() -> int:
+        try:
+            result = subprocess.run(["who"], check=False, capture_output=True, text=True, timeout=2)
+            if result.returncode != 0:
+                return 0
+            return sum(1 for ln in result.stdout.splitlines() if "pts/" in ln)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _failed_login_attempts_24h() -> int:
+        auth_log = Path("/var/log/auth.log")
+        if not auth_log.exists():
+            return 0
+
+        now = datetime.datetime.now()
+        current_year = now.year
+        cutoff = now - datetime.timedelta(hours=24)
+        months = {
+            "Jan": 1,
+            "Feb": 2,
+            "Mar": 3,
+            "Apr": 4,
+            "May": 5,
+            "Jun": 6,
+            "Jul": 7,
+            "Aug": 8,
+            "Sep": 9,
+            "Oct": 10,
+            "Nov": 11,
+            "Dec": 12,
+        }
+
+        count = 0
+        for line in auth_log.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "Failed password" not in line and "authentication failure" not in line:
+                continue
+            match = re.match(r"^([A-Z][a-z]{2})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})", line)
+            if not match:
+                continue
+
+            month = months.get(match.group(1))
+            day = int(match.group(2))
+            tstamp = match.group(3)
+            if not month:
+                continue
+
+            try:
+                dt = datetime.datetime.strptime(
+                    f"{current_year}-{month:02d}-{day:02d} {tstamp}", "%Y-%m-%d %H:%M:%S"
+                )
+            except ValueError:
+                continue
+
+            if dt > now:
+                dt = dt.replace(year=current_year - 1)
+            if dt >= cutoff:
+                count += 1
+        return count
+
+    @staticmethod
+    def _log_error_count_1h() -> int:
+        if not file_handler.stream:
+            return 0
+
+        cutoff = datetime.datetime.now() - datetime.timedelta(hours=1)
+        count = 0
+        log_file = LOG_DIR / "masterbot.log"
+        if not log_file.exists():
+            return 0
+
+        for line in log_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if " ERROR " not in line:
+                continue
+            parts = line.split(" ", 2)
+            if len(parts) < 2:
+                continue
+            try:
+                ts = datetime.datetime.strptime(f"{parts[0]} {parts[1]}", "%Y-%m-%d %H:%M:%S,%f")
+            except ValueError:
+                continue
+            if ts >= cutoff:
+                count += 1
+        return count
+
+    @classmethod
+    def collect(cls) -> PresenceTelemetry:
+        load_avg_1m = os.getloadavg()[0] if hasattr(os, "getloadavg") else 0.0
+        return PresenceTelemetry(
+            load_avg_1m=round(load_avg_1m, 2),
+            memory_used_pct=cls._memory_used_pct(),
+            disk_used_pct=cls._disk_used_pct(),
+            pending_updates=cls._pending_updates(),
+            active_ssh_sessions=cls._active_ssh_sessions(),
+            failed_login_attempts_24h=cls._failed_login_attempts_24h(),
+            reconnect_events=runtime_counters.reconnects_last_hour(),
+            log_error_count_1h=cls._log_error_count_1h(),
+        )
+
+
+class PresenceStateClassifier:
+    PRIORITY = [
+        "perimeter_alert",
+        "capacity_warning",
+        "elevated_load",
+        "operator_engaged",
+        "pending_updates",
+        "idle",
+    ]
+
+    @staticmethod
+    def classify(telemetry: PresenceTelemetry) -> str:
+        cpu_count = max(1, os.cpu_count() or 1)
+        normalized_load = telemetry.load_avg_1m / cpu_count
+
+        rules = {
+            "perimeter_alert": telemetry.failed_login_attempts_24h >= 5
+            or telemetry.reconnect_events >= 3
+            or telemetry.log_error_count_1h >= 20,
+            "capacity_warning": telemetry.disk_used_pct >= 85
+            or (telemetry.memory_used_pct is not None and telemetry.memory_used_pct >= 90),
+            "elevated_load": normalized_load >= 0.9,
+            "operator_engaged": telemetry.active_ssh_sessions > 0,
+            "pending_updates": telemetry.pending_updates > 0,
+            "idle": True,
+        }
+
+        for state in PresenceStateClassifier.PRIORITY:
+            if rules.get(state):
+                return state
+        return "idle"
+
+
+class PresencePhraseMapper:
+    PHRASES = {
+        "idle": [
+            "Cold Silence",
+            "Observing",
+            "Maintaining Clarity",
+            "Entropy Stable",
+        ],
+        "elevated_load": [
+            "Signal Analysis // elevated",
+            "Thread Contention",
+            "Stress Testing Reality",
+        ],
+        "pending_updates": [
+            "Stack Trace Review // pending",
+            "Integrity Check Required",
+            "Update Deliberately",
+        ],
+        "operator_engaged": [
+            "Operator Engaged",
+            "Interactive Session",
+            "Awaiting Command",
+        ],
+        "capacity_warning": [
+            "Disk Pressure Rising",
+            "Entropy Budget Exceeded",
+            "Resource Arbitration",
+        ],
+        "perimeter_alert": [
+            "Perimeter Alert",
+            "Authentication Drift Detected",
+            "Gateway Integrity Review",
+        ],
+    }
+
+    @staticmethod
+    def _deterministic_phrase(state: str, interval_s: int = 600) -> str:
+        options = PresencePhraseMapper.PHRASES.get(state, PresencePhraseMapper.PHRASES["idle"])
+        bucket = int(time.time() // interval_s)
+        seed = hashlib.sha256(f"{state}:{bucket}".encode("utf-8")).digest()
+        idx = int.from_bytes(seed[:4], "big") % len(options)
+        return options[idx]
+
+    @staticmethod
+    def _suffix(state: str, telemetry: PresenceTelemetry) -> str:
+        if state == "elevated_load":
+            return f" // load {telemetry.load_avg_1m:.2f}"
+        if state == "pending_updates" and telemetry.pending_updates > 0:
+            return f" // {telemetry.pending_updates} updates"
+        if state == "capacity_warning":
+            if telemetry.disk_used_pct >= 85:
+                return f" // disk {telemetry.disk_used_pct:.0f}%"
+            if telemetry.memory_used_pct is not None:
+                return f" // mem {telemetry.memory_used_pct:.0f}%"
+        if state == "perimeter_alert":
+            return f" // failures {telemetry.failed_login_attempts_24h}"
+        return ""
+
+    @classmethod
+    def map_phrase(cls, state: str, telemetry: PresenceTelemetry) -> str:
+        base = cls._deterministic_phrase(state)
+        return f"{base}{cls._suffix(state, telemetry)}"
 
 
 @tasks.loop(seconds=600)
-async def rotate_presence() -> None:
-    game = random.choice(PRESENCE_GAMES)
-    suffix = random.choice(PRESENCE_SUFFIXES)
+async def presence_update_loop() -> None:
+    telemetry = await asyncio.to_thread(PresenceTelemetryCollector.collect)
+    state = PresenceStateClassifier.classify(telemetry)
+    phrase = PresencePhraseMapper.map_phrase(state, telemetry)
 
-    activity = discord.Game(name=f"{game}{suffix}")
-    await bot.change_presence(activity=activity)
-    logger.info(f"Presence changed to: {game}{suffix}")
-
-
-async def _presence_during_index_build(build_task: "asyncio.Task[None]") -> None:
-    spinner = ["◐", "◓", "◑", "◒"]
-    idx = 0
-    while not build_task.done():
-        pct = sol_engine.build_progress_percent()
-        activity = discord.Game(name=f"SOL warming up {spinner[idx % len(spinner)]} ({pct}%)")
-        try:
-            await bot.change_presence(status=discord.Status.idle, activity=activity)
-        except Exception:
-            logger.debug("SOL presence update skipped", exc_info=True)
-        idx += 1
-        await asyncio.sleep(2)
+    await bot.change_presence(status=discord.Status.idle, activity=discord.Game(name=phrase))
+    logger.info("Presence state=%s phrase=%s telemetry=%s", state, phrase, telemetry)
 
 # ----------------------------
 # Helpers
@@ -1408,22 +1658,20 @@ async def starwars_cmd(ctx: commands.Context) -> None:
 async def on_ready() -> None:
     logger.warning("MasterBot is now active")
     bot.launch_time = time.time()
-    activity = discord.Game(name="Chapter One: Shall We Play A Game?")
-    await bot.change_presence(status=discord.Status.idle, activity=activity)
-
-    if not rotate_presence.is_running():
-        rotate_presence.start()
+    if not presence_update_loop.is_running():
+        presence_update_loop.start()
 
     build_task = asyncio.create_task(sol_engine.build_index())
-    monitor_task = asyncio.create_task(_presence_during_index_build(build_task))
     try:
         await build_task
     except Exception:
         logger.exception("SOL index build failed")
-    finally:
-        monitor_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await monitor_task
+
+
+@bot.event
+async def on_resumed() -> None:
+    runtime_counters.note_reconnect()
+    logger.warning("Gateway session resumed")
 
 
 @bot.event
