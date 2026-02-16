@@ -380,6 +380,7 @@ class SolEngine:
 
 
 sol_engine = SolEngine(openai_client)
+index_initialized = False
 
 # ----------------------------
 # Presence system
@@ -1656,16 +1657,19 @@ async def starwars_cmd(ctx: commands.Context) -> None:
 # ----------------------------
 @bot.event
 async def on_ready() -> None:
+    global index_initialized
     logger.warning("MasterBot is now active")
     bot.launch_time = time.time()
     if not presence_update_loop.is_running():
         presence_update_loop.start()
 
-    build_task = asyncio.create_task(sol_engine.build_index())
-    try:
-        await build_task
-    except Exception:
-        logger.exception("SOL index build failed")
+    if not index_initialized:
+        index_initialized = True
+        build_task = asyncio.create_task(sol_engine.build_index())
+        try:
+            await build_task
+        except Exception:
+            logger.exception("SOL index build failed")
 
 
 @bot.event
