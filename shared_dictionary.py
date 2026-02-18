@@ -252,34 +252,80 @@ def lookup_canonical(word: str, cache: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================
-# Overlays
+# Overlays (multi-user compatible)
 # ============================
 
 def load_shared_dictionaries() -> List[Dict[str, Any]]:
+    """
+    Loads dict_*.json files.
+
+    Supports:
+    1) Legacy single-user format:
+       {
+         "user_id": "sol",
+         "entries": {...}
+       }
+
+    2) Consolidated multi-user format:
+       {
+         "users": {
+           "sol": { "entries": {...} },
+           "david": { "entries": {...} }
+         }
+       }
+
+    Returns a normalized list of:
+       {
+         "user_id": <user>,
+         "entries": {...},
+         "path": <file path>
+       }
+    """
     out = []
+
     for path in sorted(glob.glob(DICT_PATTERN)):
         try:
             with open(path, "r", encoding="utf-8") as f:
-                d = json.load(f)
-                if isinstance(d, dict) and "entries" in d:
-                    out.append({"path": path, **d})
+                data = json.load(f)
+
+            # Legacy format
+            if isinstance(data, dict) and "entries" in data:
+                out.append({
+                    "user_id": data.get("user_id") or os.path.basename(path),
+                    "entries": data.get("entries", {}),
+                    "path": path,
+                })
+
+            # New consolidated format
+            elif isinstance(data, dict) and "users" in data:
+                for user_id, user_data in data["users"].items():
+                    out.append({
+                        "user_id": user_id,
+                        "entries": user_data.get("entries", {}),
+                        "path": path,
+                    })
+
         except Exception as e:
             print(c(f"Failed to load {path}: {e}", "yellow"))
+
     return out
 
 
 def aggregate_overlays(word: str, dictionaries: List[Dict[str, Any]]) -> List[Dict]:
     w = word.lower()
     shared = []
+
     for d in dictionaries:
-        user = d.get("user_id") or os.path.basename(d["path"]).replace("dict_", "").replace(".json", "")
+        user = d.get("user_id", "unknown")
+
         for entry in d.get("entries", {}).get(w, []):
             shared.append({
                 "user": user,
                 "text": entry.get("text", ""),
                 "tags": entry.get("tags", []),
-                "created": entry.get("created", "")
+                "created": entry.get("created", ""),
             })
+
     shared.sort(key=lambda x: x.get("created") or "", reverse=True)
     return shared
 
@@ -287,34 +333,57 @@ def aggregate_overlays(word: str, dictionaries: List[Dict[str, Any]]) -> List[Di
 def search_overlays(pattern: str, dictionaries: List[Dict[str, Any]]) -> List[str]:
     p = pattern.lower()
     hits = set()
+
     for d in dictionaries:
         for word, entries in d.get("entries", {}).items():
             for e in entries:
                 if p in word or p in e.get("text", "").lower():
                     hits.add(word)
+
     return sorted(hits)
 
 
 def list_augmented_words(dictionaries: List[Dict[str, Any]]) -> List[str]:
     words = set()
+
     for d in dictionaries:
         words.update(d.get("entries", {}).keys())
+
     return sorted(words)
 
 
-def add_personal_definition(word: str, text: str, user_file: str):
-    data = load_json(
-        user_file,
-        {"user_id": user_file.replace("dict_", "").replace(".json", ""), "entries": {}}
-    )
+def add_personal_definition(word: str, text: str, user_file: str, user_id: Optional[str] = None):
+    data = load_json(user_file, {})
+
+    if not data:
+        # Default to consolidated structure
+        data = {"users": {}}
+
+    # Determine if legacy or consolidated
+    if "users" in data:
+        # Consolidated format
+        if not user_id:
+            user_id = input("User ID: ").strip()
+            if not user_id:
+                print(c("User ID required for consolidated file.", "red"))
+                return
+
+        user_block = data["users"].setdefault(user_id, {"entries": {}})
+        entries = user_block.setdefault("entries", {})
+
+    else:
+        # Legacy format
+        user_id = data.get("user_id") or user_file.replace("dict_", "").replace(".json", "")
+        entries = data.setdefault("entries", {})
 
     entry = {
         "text": text.strip(),
         "tags": [],
-        "created": datetime.utcnow().isoformat() + "Z"
+        "created": datetime.utcnow().isoformat() + "Z",
     }
 
-    data.setdefault("entries", {}).setdefault(word.lower(), []).append(entry)
+    entries.setdefault(word.lower(), []).append(entry)
+
     save_json(user_file, data)
     save_last_user_file(user_file)
     print(c("✓ Definition added.", "green"))
