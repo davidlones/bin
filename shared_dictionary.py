@@ -96,6 +96,12 @@ def clean_definition(text: Optional[str]) -> str:
     return text
 
 
+def normalize_entry_text(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return _WS_RE.sub(" ", text).strip().lower()
+
+
 def is_valid_definition(text: str) -> bool:
     blacklist = [
         "ISO 639",
@@ -281,7 +287,40 @@ def load_shared_dictionaries() -> List[Dict[str, Any]]:
          "path": <file path>
        }
     """
-    out = []
+    merged_users: Dict[str, Dict[str, Any]] = {}
+    user_paths: Dict[str, List[str]] = {}
+
+    def merge_user_entries(user_id: str, entries: Dict[str, Any], path: str):
+        user = merged_users.setdefault(user_id, {"entries": {}})
+        path_list = user_paths.setdefault(user_id, [])
+        if path_list and path not in path_list:
+            print(c(f"⚠️ Merging duplicate user_id '{user_id}' across multiple files.", "yellow"))
+        if path not in path_list:
+            path_list.append(path)
+
+        for word, raw_entries in (entries or {}).items():
+            word_key = (word or "").strip().lower()
+            if not word_key:
+                continue
+
+            incoming = raw_entries if isinstance(raw_entries, list) else []
+            target_entries = user["entries"].setdefault(word_key, [])
+            seen = {normalize_entry_text(e.get("text", "")) for e in target_entries}
+
+            for entry in incoming:
+                if not isinstance(entry, dict):
+                    continue
+
+                key = normalize_entry_text(entry.get("text", ""))
+                if not key or key in seen:
+                    continue
+
+                target_entries.append({
+                    "text": entry.get("text", ""),
+                    "tags": entry.get("tags", []),
+                    "created": entry.get("created", ""),
+                })
+                seen.add(key)
 
     for path in sorted(glob.glob(DICT_PATTERN)):
         try:
@@ -290,24 +329,26 @@ def load_shared_dictionaries() -> List[Dict[str, Any]]:
 
             # Legacy format
             if isinstance(data, dict) and "entries" in data:
-                out.append({
-                    "user_id": data.get("user_id") or os.path.basename(path),
-                    "entries": data.get("entries", {}),
-                    "path": path,
-                })
+                user_id = data.get("user_id") or os.path.basename(path)
+                merge_user_entries(user_id, data.get("entries", {}), path)
 
             # New consolidated format
             elif isinstance(data, dict) and "users" in data:
                 for user_id, user_data in data["users"].items():
-                    out.append({
-                        "user_id": user_id,
-                        "entries": user_data.get("entries", {}),
-                        "path": path,
-                    })
+                    if not isinstance(user_data, dict):
+                        continue
+                    merge_user_entries(user_id, user_data.get("entries", {}), path)
 
         except Exception as e:
             print(c(f"Failed to load {path}: {e}", "yellow"))
 
+    out = []
+    for user_id in sorted(merged_users):
+        out.append({
+            "user_id": user_id,
+            "entries": merged_users[user_id]["entries"],
+            "path": ", ".join(user_paths.get(user_id, [])),
+        })
     return out
 
 
@@ -382,7 +423,14 @@ def add_personal_definition(word: str, text: str, user_file: str, user_id: Optio
         "created": datetime.utcnow().isoformat() + "Z",
     }
 
-    entries.setdefault(word.lower(), []).append(entry)
+    word_entries = entries.setdefault(word.lower(), [])
+    new_key = normalize_entry_text(entry["text"])
+    for existing in word_entries:
+        if normalize_entry_text(existing.get("text", "")) == new_key:
+            print(c("✓ Duplicate definition already exists for this user; skipped.", "yellow"))
+            return
+
+    word_entries.append(entry)
 
     save_json(user_file, data)
     save_last_user_file(user_file)
